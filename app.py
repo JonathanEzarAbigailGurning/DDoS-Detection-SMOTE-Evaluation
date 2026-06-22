@@ -8,6 +8,7 @@ import time
 import io
 import os
 import glob
+import zipfile
 
 warnings.filterwarnings('ignore')
 
@@ -122,46 +123,93 @@ for key in ['trained', 'results']:
 # ─── Dataset Discovery ────────────────────────────────────────────────────────
 def find_dataset():
     """
-    Cari dataset CSV di folder yang sama dengan script ini.
-    Prioritas: file yang namanya mengandung 'ddos', 'DDoS', 'ids', 'Friday', dst.
-    Fallback: CSV pertama yang ditemukan.
+    Cari dataset di folder yang sama dengan script ini.
+    Mendukung: .csv langsung, atau .zip yang berisi .csv di dalamnya.
+    Prioritas nama: ddos, DDoS, ids, Friday, cic, attack.
+    Return: (path, type, all_files)
+      type = 'csv' | 'zip'
     """
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    all_csv = glob.glob(os.path.join(base_dir, "*.csv"))
-
-    if not all_csv:
-        return None, []
-
-    # Prioritaskan file dengan nama yang relevan
     priority_keywords = ['ddos', 'DDoS', 'ids', 'IDS', 'friday', 'Friday', 'cic', 'CIC', 'attack']
+
+    # Cari ZIP dulu
+    all_zip = glob.glob(os.path.join(base_dir, "*.zip"))
+    all_csv = glob.glob(os.path.join(base_dir, "*.csv"))
+    all_files = all_zip + all_csv
+
+    if not all_files:
+        return None, None, []
+
+    # Prioritaskan berdasarkan keyword
     for kw in priority_keywords:
+        for f in all_zip:
+            if kw in os.path.basename(f):
+                return f, 'zip', all_files
         for f in all_csv:
             if kw in os.path.basename(f):
-                return f, all_csv
+                return f, 'csv', all_files
 
-    return all_csv[0], all_csv
+    # Fallback: zip pertama, lalu csv pertama
+    if all_zip:
+        return all_zip[0], 'zip', all_files
+    return all_csv[0], 'csv', all_files
+
+
+def load_dataset(path, file_type):
+    """
+    Load dataset dari path.
+    Jika file_type == 'zip', ekstrak CSV pertama dari dalam ZIP.
+    """
+    if file_type == 'csv':
+        return pd.read_csv(path)
+
+    # file_type == 'zip'
+    with zipfile.ZipFile(path, 'r') as zf:
+        # Cari file CSV di dalam ZIP (bisa di subfolder)
+        csv_members = [m for m in zf.namelist() if m.lower().endswith('.csv')]
+        if not csv_members:
+            raise ValueError(
+                f"Tidak ada file CSV di dalam ZIP '{os.path.basename(path)}'. "
+                f"Isi ZIP: {zf.namelist()}"
+            )
+        # Ambil CSV pertama (biasanya hanya ada satu)
+        target_csv = csv_members[0]
+        with zf.open(target_csv) as f:
+            return pd.read_csv(f)
+
+
+def display_name(path, file_type):
+    """Label tampilan untuk dataset."""
+    base = os.path.basename(path)
+    if file_type == 'zip':
+        return f"{base} 📦"
+    return base
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🛡️ DDoS Detector")
     st.markdown("---")
 
-    dataset_path, all_csv = find_dataset()
+    dataset_path, dataset_type, all_files = find_dataset()
 
-    if all_csv:
-        csv_names = [os.path.basename(f) for f in all_csv]
+    if all_files:
+        file_names = [os.path.basename(f) for f in all_files]
+        default_name = os.path.basename(dataset_path) if dataset_path else file_names[0]
         selected_name = st.selectbox(
             "Dataset Terdeteksi",
-            csv_names,
-            index=csv_names.index(os.path.basename(dataset_path)) if dataset_path else 0,
-            help="File CSV yang ditemukan di folder yang sama dengan app.py"
+            file_names,
+            index=file_names.index(default_name),
+            help="File .csv atau .zip yang ditemukan di folder yang sama dengan app.py"
         )
-        dataset_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), selected_name)
+        selected_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), selected_name)
+        selected_type = 'zip' if selected_name.lower().endswith('.zip') else 'csv'
+        dataset_path = selected_path
+        dataset_type = selected_type
     else:
         st.markdown("""
 <div class="error-box">
-⚠️ Tidak ada file CSV ditemukan di folder ini.<br>
-Letakkan file dataset (.csv) di folder yang sama dengan <code>app.py</code>.
+⚠️ Tidak ada file CSV/ZIP ditemukan di folder ini.<br>
+Letakkan file dataset (.csv atau .zip berisi .csv) di folder yang sama dengan <code>app.py</code>.
 </div>
 """, unsafe_allow_html=True)
 
@@ -332,8 +380,8 @@ def make_cv_fig(cv_results):
     width = 0.35
     colors = ['#3498db', '#27ae60']
     for i, (name, scores, color) in enumerate(zip(cv_results.keys(), cv_results.values(), colors)):
-        bars = ax.bar(x + (i-0.5)*width, scores*100, width,
-                      label=name, color=color, edgecolor='#060e1a', alpha=0.9)
+        ax.bar(x + (i-0.5)*width, scores*100, width,
+               label=name, color=color, edgecolor='#060e1a', alpha=0.9)
         ax.axhline(scores.mean()*100, color=color, linestyle='--', linewidth=1.5,
                    label=f'{name} Mean: {scores.mean()*100:.2f}%', alpha=0.7)
     ax.set_xlabel('Fold', color='#7eb8d4', fontsize=11)
@@ -353,17 +401,20 @@ if dataset_path is None:
     st.markdown("""
 <div class="error-box">
 ❌ <strong>Tidak ada dataset ditemukan.</strong><br><br>
-Letakkan file CSV (format CIC-IDS2017) di folder yang sama dengan <code>app.py</code>, 
-lalu refresh halaman ini. Kolom wajib: <code>Label</code> berisi nilai <code>BENIGN</code> / <code>DDoS</code>.
+Letakkan file <code>.csv</code> atau <code>.zip</code> (berisi CSV format CIC-IDS2017) 
+di folder yang sama dengan <code>app.py</code>, lalu refresh halaman ini.<br>
+Kolom wajib: <code>Label</code> berisi nilai <code>BENIGN</code> / <code>DDoS</code>.
 </div>
 """, unsafe_allow_html=True)
     st.stop()
 
 # ─── Show dataset info before running ─────────────────────────────────────────
 if not st.session_state.trained:
+    icon = "📦" if dataset_type == 'zip' else "📂"
     st.markdown(f"""
 <div class="status-box">
-📂 <strong>Dataset ditemukan:</strong> <code>{os.path.basename(dataset_path)}</code><br>
+{icon} <strong>Dataset ditemukan:</strong> <code>{os.path.basename(dataset_path)}</code>
+{'<br>📄 File ZIP akan diekstrak otomatis saat analisis dimulai.' if dataset_type == 'zip' else ''}<br>
 Atur hyperparameter di sidebar lalu klik <strong>▶ Jalankan Analisis</strong> untuk memulai.
 </div>
 """, unsafe_allow_html=True)
@@ -378,7 +429,7 @@ if run_btn or st.session_state.trained:
         progress = st.progress(0, text="Memuat dataset...")
 
         try:
-            df = pd.read_csv(dataset_path)
+            df = load_dataset(dataset_path, dataset_type)
         except Exception as e:
             st.error(f"❌ Gagal membaca dataset: {e}")
             st.stop()
@@ -397,7 +448,6 @@ if run_btn or st.session_state.trained:
 
         le = LabelEncoder()
         df['Label_encoded'] = le.fit_transform(df['Label'])
-        label_mapping = dict(zip(le.classes_, le.transform(le.classes_)))
 
         X = df.drop(columns=['Label', 'Label_encoded'])
         y = df['Label_encoded']
@@ -428,7 +478,7 @@ if run_btn or st.session_state.trained:
         rf_model = RandomForestClassifier(
             n_estimators=n_est, criterion='gini', max_depth=max_depth,
             min_samples_split=min_split, min_samples_leaf=min_leaf,
-            n_jobs=-1, random_state=42
+            n_jobs=1, random_state=42
         )
         rf_model.fit(X_train, y_train)
         rf_train_time = time.time() - t0
@@ -447,7 +497,7 @@ if run_btn or st.session_state.trained:
         rf_smote_model = RandomForestClassifier(
             n_estimators=n_est, criterion='gini', max_depth=max_depth,
             min_samples_split=min_split, min_samples_leaf=min_leaf,
-            n_jobs=-1, random_state=42
+            n_jobs=1, random_state=42
         )
         rf_smote_model.fit(X_train_smote, y_train_smote)
         rf_smote_time = time.time() - t0
@@ -465,7 +515,7 @@ if run_btn or st.session_state.trained:
             n_cv = min(cv_samples, len(X))
             X_cv, y_cv = resample(X, y, n_samples=n_cv, random_state=42, stratify=y)
             for model, name in [(dt_model, 'Decision Tree'), (rf_model, 'Random Forest')]:
-                scores = cross_val_score(model, X_cv, y_cv, cv=kfold, scoring='accuracy', n_jobs=-1)
+                scores = cross_val_score(model, X_cv, y_cv, cv=kfold, scoring='accuracy', n_jobs=1)
                 cv_results[name] = scores
 
         progress.progress(100, text="Selesai!")
